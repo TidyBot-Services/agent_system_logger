@@ -647,7 +647,7 @@ class RewindOrchestrator:
             return RewindResult(
                 success=False,
                 steps_rewound=len(executed_waypoints),
-                start_idx=start_idx,
+                start_waypoint_idx=start_idx,
                 end_waypoint_idx=end_idx,
                 error=str(e),
                 waypoints_executed=executed_waypoints,
