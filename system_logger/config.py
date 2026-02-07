@@ -68,7 +68,7 @@ class RewindConfig:
     command_rate: float = 50.0     # Hz - must be > 10 Hz for arm (100ms timeout)
 
     # Chunked smooth rewind
-    chunk_size: int = 15            # Waypoints per chunk (tune for smoothness vs responsiveness)
+    chunk_size: int = 30            # Waypoints per chunk (tune for smoothness vs responsiveness)
     chunk_duration: float = 3.0    # Seconds to execute each chunk (arm interpolation time)
 
     # What to rewind
@@ -87,6 +87,11 @@ class RewindConfig:
     auto_rewind_enabled: bool = False
     auto_rewind_percentage: float = 10.0    # % of trajectory to rewind
     monitor_interval: float = 0.1           # seconds between boundary checks
+
+    # Collision detection (active when auto_rewind_enabled is True)
+    collision_velocity_threshold: float = 0.3   # actual/commanded ratio below this = collision
+    collision_min_cmd_speed: float = 0.05       # m/s minimum commanded speed to consider
+    collision_grace_period: float = 0.5         # seconds before triggering
 
 
 @dataclass

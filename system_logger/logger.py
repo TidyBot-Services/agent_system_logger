@@ -59,6 +59,7 @@ class SystemLogger:
 
         # Background task state
         self._running = False
+        self._paused = False
         self._task: Optional[asyncio.Task] = None
         self._state_fn: Optional[Callable[[], Dict[str, Any]]] = None
 
@@ -78,8 +79,13 @@ class SystemLogger:
 
     @property
     def is_recording(self) -> bool:
-        """Return True if recording is active."""
-        return self._running
+        """Return True if recording is active (running and not paused)."""
+        return self._running and not self._paused
+
+    @property
+    def is_paused(self) -> bool:
+        """Return True if recording is paused."""
+        return self._paused
 
     @property
     def waypoint_count(self) -> int:
@@ -131,11 +137,21 @@ class SystemLogger:
             f"{len(self._waypoints)} waypoints)"
         )
 
+    def pause(self) -> None:
+        """Pause recording (e.g. during rewind)."""
+        self._paused = True
+        logger.info("[SystemLogger] Recording paused")
+
+    def resume(self) -> None:
+        """Resume recording after pause."""
+        self._paused = False
+        logger.info("[SystemLogger] Recording resumed")
+
     async def _record_loop(self) -> None:
         """Main recording loop - samples state at regular intervals."""
         while self._running:
             try:
-                if self._state_fn is not None:
+                if self._state_fn is not None and not self._paused:
                     state = self._state_fn()
                     self._record_state(state)
 

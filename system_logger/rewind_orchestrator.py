@@ -439,12 +439,23 @@ class RewindOrchestrator:
         start_idx = trajectory_len - 1
         return await self._execute_rewind(start_idx, waypoint_idx, dry_run, components)
 
+    # Convergence thresholds for base homing
+    BASE_HOME_POS_THRESHOLD = 0.05  # meters (5cm)
+    BASE_HOME_THETA_THRESHOLD = 0.087  # rad (~5 deg)
+    BASE_HOME_TIMEOUT = 10.0  # seconds
+    BASE_HOME_CMD_RATE = 10.0  # Hz
+
     async def reset_to_home(
         self,
         dry_run: bool = False,
         components: Optional[List[str]] = None,
     ) -> RewindResult:
-        """Reset to home by rewinding 100% of the trajectory.
+        """Reset to home by rewinding 100% of the trajectory, then
+        converging the base to the exact start pose.
+
+        After the trajectory rewind a feedback loop keeps commanding the
+        target base pose until the position error is below threshold
+        (corrects for tracking drift accumulated during open-loop rewind).
 
         Args:
             dry_run: If True, only return what would happen.
@@ -454,7 +465,81 @@ class RewindOrchestrator:
             RewindResult with operation details.
         """
         logger.info("[RewindOrchestrator] Reset to home triggered")
-        return await self.rewind_percentage(100.0, dry_run, components)
+
+        result = await self.rewind_percentage(100.0, dry_run, components)
+
+        if not dry_run and result.success and self._base_backend:
+            await self._converge_base_to_target((0.0, 0.0, 0.0))
+
+        return result
+
+    async def _converge_base_to_target(
+        self, target: tuple[float, float, float]
+    ) -> None:
+        """Keep commanding ``(x, y, theta)`` until the base is within threshold.
+
+        Acts like an integral correction — the base controller (Ruckig OTG)
+        plans a trajectory to the target each time, so any residual error is
+        corrected on the next command cycle.
+        """
+        tx, ty, ttheta = target
+        interval = 1.0 / self.BASE_HOME_CMD_RATE
+        deadline = asyncio.get_event_loop().time() + self.BASE_HOME_TIMEOUT
+
+        logger.info(
+            "[RewindOrchestrator] Converging base to (%.3f, %.3f, %.3f) "
+            "(pos_thr=%.3fm, theta_thr=%.3frad, timeout=%.1fs)",
+            tx, ty, ttheta,
+            self.BASE_HOME_POS_THRESHOLD,
+            self.BASE_HOME_THETA_THRESHOLD,
+            self.BASE_HOME_TIMEOUT,
+        )
+
+        converged = False
+        while asyncio.get_event_loop().time() < deadline:
+            # Command target
+            try:
+                self._base_backend.execute_action(tx, ty, ttheta)
+            except Exception as e:
+                logger.warning("[RewindOrchestrator] Base homing command failed: %s", e)
+                break
+
+            # Read current pose
+            try:
+                state = self._base_backend.get_state()
+                pose = state.get("base_pose", [])
+                if pose and len(pose) >= 3:
+                    dx = abs(pose[0] - tx)
+                    dy = abs(pose[1] - ty)
+                    dtheta = abs(pose[2] - ttheta)
+                    if dx < self.BASE_HOME_POS_THRESHOLD and \
+                       dy < self.BASE_HOME_POS_THRESHOLD and \
+                       dtheta < self.BASE_HOME_THETA_THRESHOLD:
+                        converged = True
+                        logger.info(
+                            "[RewindOrchestrator] Base home reached "
+                            "(err: x=%.4f y=%.4f theta=%.4f)",
+                            dx, dy, dtheta,
+                        )
+                        break
+            except Exception:
+                pass
+
+            await asyncio.sleep(interval)
+
+        if not converged:
+            try:
+                state = self._base_backend.get_state()
+                pose = state.get("base_pose", [0, 0, 0])
+                logger.warning(
+                    "[RewindOrchestrator] Base homing timeout — "
+                    "current=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f) "
+                    "err=(%.4f, %.4f, %.4f)",
+                    pose[0], pose[1], pose[2], tx, ty, ttheta,
+                    abs(pose[0] - tx), abs(pose[1] - ty), abs(pose[2] - ttheta),
+                )
+            except Exception:
+                logger.warning("[RewindOrchestrator] Base homing timeout (could not read state)")
 
     # -------------------------------------------------------------------------
     # Rewind execution (chunked smooth version)
@@ -564,6 +649,7 @@ class RewindOrchestrator:
             )
 
         self._is_rewinding = True
+        self._logger.pause()
         executed_waypoints: List[Dict[str, Any]] = []
 
         try:
@@ -655,6 +741,7 @@ class RewindOrchestrator:
             )
         finally:
             self._is_rewinding = False
+            self._logger.resume()
 
     def _interpolate_base_pose(
         self,
@@ -714,9 +801,13 @@ class RewindOrchestrator:
         if "gripper" in components and self._gripper_backend:
             self._gripper_backend.move(final_wp.gripper_position)
 
-        # Interpolate both arm and base through all waypoints in chunk
+        # Interpolate both arm and base through all waypoints in chunk.
+        # Arm streams at command_rate (50 Hz). Base sends interpolated
+        # positions at 10 Hz to avoid Ruckig replanning jitter.
+        base_interval = 0.1  # 10 Hz for base
         start_time = asyncio.get_event_loop().time()
         end_time = start_time + duration
+        last_base_cmd_time = 0.0
 
         while True:
             now = asyncio.get_event_loop().time()
@@ -727,12 +818,14 @@ class RewindOrchestrator:
             t = (now - start_time) / duration
             t = min(max(t, 0.0), 1.0)
 
-            # Interpolate and send base position
+            # Interpolate and send base position at 10 Hz
             if "base" in components and self._base_backend:
-                x, y, theta = self._interpolate_base_pose(chunk_waypoints, t)
-                self._base_backend.execute_action(x, y, theta)
+                if now - last_base_cmd_time >= base_interval:
+                    x, y, theta = self._interpolate_base_pose(chunk_waypoints, t)
+                    self._base_backend.execute_action(x, y, theta)
+                    last_base_cmd_time = now
 
-            # Interpolate and send arm position
+            # Interpolate and send arm position at command_rate
             if "arm" in components and self._arm_backend:
                 q_interp = self._interpolate_waypoint_sequence(chunk_waypoints, t)
                 if q_interp:
