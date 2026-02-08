@@ -121,6 +121,10 @@ class ArmBackendProtocol(Protocol):
         """Set arm control mode (1 = JOINT_POSITION)."""
         ...
 
+    def set_gains(self, **kwargs) -> bool:
+        """Set impedance control gains."""
+        ...
+
 
 class GripperBackendProtocol(Protocol):
     """Protocol for gripper backend interface."""
@@ -445,17 +449,22 @@ class RewindOrchestrator:
     BASE_HOME_TIMEOUT = 10.0  # seconds
     BASE_HOME_CMD_RATE = 10.0  # Hz
 
+    # Convergence thresholds for arm homing
+    ARM_HOME_JOINT_THRESHOLD = 0.05  # rad (~3 deg)
+    ARM_HOME_TIMEOUT = 10.0  # seconds
+    ARM_HOME_CMD_RATE = 50.0  # Hz
+
     async def reset_to_home(
         self,
         dry_run: bool = False,
         components: Optional[List[str]] = None,
     ) -> RewindResult:
         """Reset to home by rewinding 100% of the trajectory, then
-        converging the base to the exact start pose.
+        converging the base and arm to their home poses.
 
-        After the trajectory rewind a feedback loop keeps commanding the
-        target base pose until the position error is below threshold
-        (corrects for tracking drift accumulated during open-loop rewind).
+        After the trajectory rewind, feedback loops keep commanding the
+        target poses until errors are below threshold (corrects for
+        tracking drift accumulated during open-loop rewind).
 
         Args:
             dry_run: If True, only return what would happen.
@@ -468,8 +477,11 @@ class RewindOrchestrator:
 
         result = await self.rewind_percentage(100.0, dry_run, components)
 
-        if not dry_run and result.success and self._base_backend:
-            await self._converge_base_to_target((0.0, 0.0, 0.0))
+        if not dry_run and result.success:
+            if self._arm_backend:
+                await self._converge_arm_to_target(self._config.arm_home_q)
+            if self._base_backend:
+                await self._converge_base_to_target((0.0, 0.0, 0.0))
 
         return result
 
@@ -540,6 +552,95 @@ class RewindOrchestrator:
                 )
             except Exception:
                 logger.warning("[RewindOrchestrator] Base homing timeout (could not read state)")
+
+    async def _converge_arm_to_target(self, target_q: List[float]) -> None:
+        """Keep commanding arm joint positions until within threshold.
+
+        Uses smooth interpolation from current position to target to avoid
+        velocity violations (same approach as robot_sdk arm.move_joints).
+        """
+        if not self._arm_backend or not target_q:
+            return
+
+        # Read current arm position
+        try:
+            state = self._arm_backend.get_state()
+            current_q = state.get("q", [])
+            if not current_q or len(current_q) != len(target_q):
+                logger.warning("[RewindOrchestrator] Cannot read arm state for homing")
+                return
+        except Exception as e:
+            logger.warning("[RewindOrchestrator] Arm state read failed: %s", e)
+            return
+
+        # Calculate max joint delta to determine duration
+        max_delta = max(abs(c - t) for c, t in zip(current_q, target_q))
+
+        # Check if already at target
+        if max_delta < self.ARM_HOME_JOINT_THRESHOLD:
+            logger.info(
+                "[RewindOrchestrator] Arm already at home (max_delta=%.4f rad)",
+                max_delta,
+            )
+            return
+
+        # Auto-calculate duration: scale with distance, clamp to [2, 10] seconds
+        duration = max(2.0, min(10.0, max_delta / 0.5 * 4.0))
+
+        logger.info(
+            "[RewindOrchestrator] Converging arm to home "
+            "(max_delta=%.3f rad, duration=%.1fs)",
+            max_delta, duration,
+        )
+
+        # Ensure arm is in JOINT_POSITION mode
+        try:
+            self._arm_backend.set_control_mode(1)
+        except Exception as e:
+            logger.warning("[RewindOrchestrator] Failed to set arm control mode: %s", e)
+
+        interval = 1.0 / self.ARM_HOME_CMD_RATE
+        start_time = asyncio.get_event_loop().time()
+        end_time = start_time + duration
+        deadline = start_time + self.ARM_HOME_TIMEOUT
+
+        while asyncio.get_event_loop().time() < deadline:
+            now = asyncio.get_event_loop().time()
+            t = min((now - start_time) / duration, 1.0)
+
+            # Cubic ease-in-out interpolation
+            if t < 0.5:
+                s = 4 * t * t * t
+            else:
+                s = 1 - (-2 * t + 2) ** 3 / 2
+
+            q_cmd = [c + s * (tgt - c) for c, tgt in zip(current_q, target_q)]
+
+            try:
+                self._arm_backend.send_joint_position(q_cmd, blocking=False)
+            except Exception as e:
+                logger.warning("[RewindOrchestrator] Arm homing command failed: %s", e)
+                break
+
+            # After interpolation finishes, check convergence
+            if t >= 1.0:
+                try:
+                    state = self._arm_backend.get_state()
+                    actual_q = state.get("q", [])
+                    if actual_q and len(actual_q) == len(target_q):
+                        max_err = max(abs(a - tgt) for a, tgt in zip(actual_q, target_q))
+                        if max_err < self.ARM_HOME_JOINT_THRESHOLD:
+                            logger.info(
+                                "[RewindOrchestrator] Arm home reached (max_err=%.4f rad)",
+                                max_err,
+                            )
+                            return
+                except Exception:
+                    pass
+
+            await asyncio.sleep(interval)
+
+        logger.warning("[RewindOrchestrator] Arm homing timeout")
 
     # -------------------------------------------------------------------------
     # Rewind execution (chunked smooth version)
@@ -663,13 +764,17 @@ class RewindOrchestrator:
                 f"({n_waypoints} waypoints in {n_chunks} chunks, components: {components})"
             )
 
-            # Set arm to JOINT_POSITION mode before sending joint commands
+            # Set arm to JOINT_POSITION mode with lower gains for smoother rewind
             if "arm" in components and self._arm_backend:
                 try:
                     self._arm_backend.set_control_mode(1)  # 1 = JOINT_POSITION
-                    logger.info("[RewindOrchestrator] Set arm control mode to JOINT_POSITION")
+                    self._arm_backend.set_gains(
+                        joint_stiffness=[200, 200, 200, 200, 100, 75, 25],
+                        joint_damping=[30, 30, 30, 30, 15, 12, 8],
+                    )
+                    logger.info("[RewindOrchestrator] Set arm to JOINT_POSITION with low rewind gains")
                 except Exception as e:
-                    logger.warning(f"[RewindOrchestrator] Failed to set control mode: {e}")
+                    logger.warning(f"[RewindOrchestrator] Failed to set control mode/gains: {e}")
 
             command_interval = 1.0 / self._config.command_rate
 
@@ -740,6 +845,16 @@ class RewindOrchestrator:
                 components_rewound=components,
             )
         finally:
+            # Restore default gains
+            if "arm" in components and self._arm_backend:
+                try:
+                    self._arm_backend.set_gains(
+                        joint_stiffness=[600, 600, 600, 600, 250, 150, 50],
+                        joint_damping=[50, 50, 50, 50, 30, 25, 15],
+                    )
+                    logger.info("[RewindOrchestrator] Restored default arm gains")
+                except Exception as e:
+                    logger.warning(f"[RewindOrchestrator] Failed to restore gains: {e}")
             self._is_rewinding = False
             self._logger.resume()
 
