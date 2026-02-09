@@ -46,6 +46,9 @@ class LoggerConfig:
     auto_save_interval: float = 60.0  # seconds
 
 
+ARM_HOME_Q = [0.0, -0.785, 0.0, -2.356, 0.0, 1.913, 0.785]
+
+
 @dataclass
 class RewindConfig:
     """Configuration for the RewindOrchestrator.
@@ -84,9 +87,7 @@ class RewindConfig:
     safety_margin: float = 0.1     # meters inside workspace boundary
 
     # Arm home position (Franka Panda default)
-    arm_home_q: List[float] = field(default_factory=lambda: [
-        0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785
-    ])
+    arm_home_q: List[float] = field(default_factory=lambda: list(ARM_HOME_Q))
 
     # Auto-rewind settings
     auto_rewind_enabled: bool = False

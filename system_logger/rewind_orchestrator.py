@@ -775,6 +775,8 @@ class RewindOrchestrator:
                     logger.info("[RewindOrchestrator] Set arm to JOINT_POSITION with low rewind gains")
                 except Exception as e:
                     logger.warning(f"[RewindOrchestrator] Failed to set control mode/gains: {e}")
+                    logger.warning("[RewindOrchestrator] Skipping arm component for this rewind")
+                    components.remove("arm")
 
             command_interval = 1.0 / self._config.command_rate
 
