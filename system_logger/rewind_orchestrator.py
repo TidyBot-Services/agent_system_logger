@@ -485,6 +485,18 @@ class RewindOrchestrator:
 
         return result
 
+    async def go_home(self) -> None:
+        """Converge arm and base to their home poses without rewinding.
+
+        Skips trajectory rewind — just moves directly to home.
+        """
+        logger.info("[RewindOrchestrator] Go home triggered (no rewind)")
+        if self._arm_backend:
+            await self._converge_arm_to_target(self._config.arm_home_q)
+        if self._base_backend:
+            await self._converge_base_to_target((0.0, 0.0, 0.0))
+        logger.info("[RewindOrchestrator] Go home complete")
+
     async def _converge_base_to_target(
         self, target: tuple[float, float, float]
     ) -> None:
@@ -752,6 +764,14 @@ class RewindOrchestrator:
         self._is_rewinding = True
         self._logger.pause()
         executed_waypoints: List[Dict[str, Any]] = []
+
+        # Open gripper before rewinding arm/base
+        if "gripper" in components and self._gripper_backend:
+            try:
+                await asyncio.to_thread(self._gripper_backend.open)
+                logger.info("[RewindOrchestrator] Opened gripper before rewind")
+            except Exception as e:
+                logger.warning(f"[RewindOrchestrator] Failed to open gripper: {e}")
 
         try:
             chunk_size = self._config.chunk_size

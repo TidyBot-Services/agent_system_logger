@@ -77,7 +77,7 @@ class RewindConfig:
     # What to rewind
     rewind_base: bool = True
     rewind_arm: bool = True
-    rewind_gripper: bool = False   # Usually don't want to auto-rewind gripper
+    rewind_gripper: bool = True    # Open gripper before rewinding arm/base
 
     # Velocity scaling (slower = safer)
     arm_velocity_scale: float = 0.3

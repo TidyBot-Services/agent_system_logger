@@ -45,6 +45,8 @@ class UnifiedWaypoint:
     # Base state
     base_pose: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     base_velocity: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    odom_pose: Optional[List[float]] = None   # Raw wheel odometry [x, y, theta]
+    mocap_pose: Optional[List[float]] = None  # Raw mocap pose [x, y, theta] or None
 
     # Arm state
     arm_q: List[float] = field(default_factory=list)
@@ -73,6 +75,8 @@ class UnifiedWaypoint:
             "index": self.index,
             "base_pose": self.base_pose,
             "base_velocity": self.base_velocity,
+            "odom_pose": self.odom_pose,
+            "mocap_pose": self.mocap_pose,
             "arm_q": self.arm_q,
             "arm_dq": self.arm_dq,
             "ee_pose": self.ee_pose,
@@ -100,6 +104,8 @@ class UnifiedWaypoint:
             index=data.get("index", 0),
             base_pose=data.get("base_pose", [0.0, 0.0, 0.0]),
             base_velocity=data.get("base_velocity", [0.0, 0.0, 0.0]),
+            odom_pose=data.get("odom_pose"),
+            mocap_pose=data.get("mocap_pose"),
             arm_q=data.get("arm_q", []),
             arm_dq=data.get("arm_dq", []),
             ee_pose=data.get("ee_pose", []),
@@ -128,11 +134,16 @@ class UnifiedWaypoint:
         arm = state.get("arm", {})
         gripper = state.get("gripper", {})
 
+        raw_odom = base.get("odom_pose")
+        raw_mocap = base.get("mocap_pose")
+
         return cls(
             t=t,
             index=index,
             base_pose=list(base.get("pose", [0.0, 0.0, 0.0])),
             base_velocity=list(base.get("velocity", [0.0, 0.0, 0.0])),
+            odom_pose=list(raw_odom) if raw_odom else None,
+            mocap_pose=list(raw_mocap) if raw_mocap else None,
             arm_q=list(arm.get("q", [])),
             arm_dq=list(arm.get("dq", [])),
             ee_pose=list(arm.get("ee_pose", [])),
