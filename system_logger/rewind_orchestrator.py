@@ -133,6 +133,10 @@ class GripperBackendProtocol(Protocol):
         """Move gripper to position (0-255)."""
         ...
 
+    def open(self, speed: int = 255, force: int = 255) -> tuple:
+        """Open the gripper fully."""
+        ...
+
     def get_state(self) -> Dict[str, Any]:
         """Get current gripper state."""
         ...
@@ -192,6 +196,7 @@ class RewindOrchestrator:
         self._base_backend: Optional[BaseBackendProtocol] = None
         self._arm_backend: Optional[ArmBackendProtocol] = None
         self._gripper_backend: Optional[GripperBackendProtocol] = None
+        self._mocap_backend: Any = None  # Optional MocapBackend for odom correction
 
         # State
         self._is_rewinding = False
@@ -220,6 +225,7 @@ class RewindOrchestrator:
         base_backend: Optional[BaseBackendProtocol] = None,
         arm_backend: Optional[ArmBackendProtocol] = None,
         gripper_backend: Optional[GripperBackendProtocol] = None,
+        mocap_backend: Any = None,
     ) -> None:
         """Set the backend interfaces for rewind commands.
 
@@ -227,10 +233,58 @@ class RewindOrchestrator:
             base_backend: Base control backend.
             arm_backend: Arm control backend.
             gripper_backend: Gripper control backend.
+            mocap_backend: Optional MocapBackend for odom↔mocap correction.
         """
         self._base_backend = base_backend
         self._arm_backend = arm_backend
         self._gripper_backend = gripper_backend
+        self._mocap_backend = mocap_backend
+
+    def _world_to_odom(self, wx: float, wy: float, wtheta: float) -> Optional[tuple]:
+        """Convert a world-frame (mocap) target to odom-frame command.
+
+        Uses the current odom↔mocap readings to compute the rigid transform
+        (rotation + translation) between frames. This correctly handles
+        heading drift — a pure additive offset fails when theta drifts.
+
+        Args:
+            wx, wy, wtheta: Target pose in world/mocap frame.
+
+        Returns:
+            (odom_x, odom_y, odom_theta) command, or None if mocap unavailable.
+        """
+        if self._mocap_backend is None or self._base_backend is None:
+            return None
+        try:
+            mocap_state = self._mocap_backend.get_state()
+        except Exception:
+            return None
+        if not mocap_state.get("tracking_valid", False):
+            return None
+        mocap = mocap_state.get("mocap_pose")
+        if mocap is None:
+            return None
+        try:
+            base_state = self._base_backend.get_state()
+        except Exception:
+            return None
+        odom = base_state.get("base_pose", [0.0, 0.0, 0.0])
+
+        import math
+        alpha = odom[2] - mocap[2]  # heading drift
+        cos_a = math.cos(alpha)
+        sin_a = math.sin(alpha)
+
+        # Displacement from current mocap to target (world frame)
+        dx_w = wx - mocap[0]
+        dy_w = wy - mocap[1]
+
+        # Rotate into odom frame and add to current odom position
+        return (
+            odom[0] + cos_a * dx_w - sin_a * dy_w,
+            odom[1] + sin_a * dx_w + cos_a * dy_w,
+            wtheta + alpha,
+        )
 
     # -------------------------------------------------------------------------
     # Safety checks
@@ -489,8 +543,15 @@ class RewindOrchestrator:
         """Converge arm and base to their home poses without rewinding.
 
         Skips trajectory rewind — just moves directly to home.
+        Opens the gripper before moving arm/base.
         """
         logger.info("[RewindOrchestrator] Go home triggered (no rewind)")
+        if self._gripper_backend:
+            try:
+                await asyncio.to_thread(self._gripper_backend.open)
+                logger.info("[RewindOrchestrator] Opened gripper")
+            except Exception as e:
+                logger.warning(f"[RewindOrchestrator] Failed to open gripper: {e}")
         if self._arm_backend:
             await self._converge_arm_to_target(self._config.arm_home_q)
         if self._base_backend:
@@ -501,6 +562,9 @@ class RewindOrchestrator:
         self, target: tuple[float, float, float]
     ) -> None:
         """Keep commanding ``(x, y, theta)`` until the base is within threshold.
+
+        When mocap is available, applies odom↔mocap offset correction so
+        the base converges on the real-world target despite odometry drift.
 
         Acts like an integral correction — the base controller (Ruckig OTG)
         plans a trajectory to the target each time, so any residual error is
@@ -519,23 +583,35 @@ class RewindOrchestrator:
             self.BASE_HOME_TIMEOUT,
         )
 
+        last_cmd = None  # Last commanded odom-frame target
         converged = False
         while asyncio.get_event_loop().time() < deadline:
-            # Command target
+            # Convert world-frame target to odom-frame command
+            odom_cmd = self._world_to_odom(tx, ty, ttheta)
+            if odom_cmd is not None:
+                last_cmd = odom_cmd
+
+            if last_cmd is not None:
+                cmd_x, cmd_y, cmd_theta = last_cmd
+            else:
+                # No mocap — send target directly (pure odom)
+                cmd_x, cmd_y, cmd_theta = tx, ty, ttheta
+
             try:
-                self._base_backend.execute_action(tx, ty, ttheta)
+                self._base_backend.execute_action(cmd_x, cmd_y, cmd_theta)
             except Exception as e:
                 logger.warning("[RewindOrchestrator] Base homing command failed: %s", e)
                 break
 
-            # Read current pose
+            # Check convergence
             try:
                 state = self._base_backend.get_state()
-                pose = state.get("base_pose", [])
-                if pose and len(pose) >= 3:
-                    dx = abs(pose[0] - tx)
-                    dy = abs(pose[1] - ty)
-                    dtheta = abs(pose[2] - ttheta)
+                odom = state.get("base_pose", [])
+                if odom and len(odom) >= 3:
+                    # Check odom convergence against commanded target
+                    dx = abs(odom[0] - cmd_x)
+                    dy = abs(odom[1] - cmd_y)
+                    dtheta = abs(odom[2] - cmd_theta)
                     if dx < self.BASE_HOME_POS_THRESHOLD and \
                        dy < self.BASE_HOME_POS_THRESHOLD and \
                        dtheta < self.BASE_HOME_THETA_THRESHOLD:
@@ -554,13 +630,14 @@ class RewindOrchestrator:
         if not converged:
             try:
                 state = self._base_backend.get_state()
-                pose = state.get("base_pose", [0, 0, 0])
+                odom = state.get("base_pose", [0, 0, 0])
                 logger.warning(
                     "[RewindOrchestrator] Base homing timeout — "
-                    "current=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f) "
-                    "err=(%.4f, %.4f, %.4f)",
-                    pose[0], pose[1], pose[2], tx, ty, ttheta,
-                    abs(pose[0] - tx), abs(pose[1] - ty), abs(pose[2] - ttheta),
+                    "odom=(%.3f, %.3f, %.3f) cmd=(%.3f, %.3f, %.3f) "
+                    "target=(%.3f, %.3f, %.3f)",
+                    odom[0], odom[1], odom[2],
+                    cmd_x, cmd_y, cmd_theta,
+                    tx, ty, ttheta,
                 )
             except Exception:
                 logger.warning("[RewindOrchestrator] Base homing timeout (could not read state)")
@@ -941,10 +1018,16 @@ class RewindOrchestrator:
         # Interpolate both arm and base through all waypoints in chunk.
         # Arm streams at command_rate (50 Hz). Base sends interpolated
         # positions at 10 Hz to avoid Ruckig replanning jitter.
+        #
+        # Waypoint base_pose values may be in mocap frame (when mocap was
+        # tracking during recording). We translate them to odom frame using
+        # the current odom↔mocap offset so the base follows the real-world
+        # trajectory even if odometry has drifted.
         base_interval = 0.1  # 10 Hz for base
         start_time = asyncio.get_event_loop().time()
         end_time = start_time + duration
         last_base_cmd_time = 0.0
+        last_base_cmd = None  # Last commanded odom-frame target
 
         while True:
             now = asyncio.get_event_loop().time()
@@ -959,7 +1042,14 @@ class RewindOrchestrator:
             if "base" in components and self._base_backend:
                 if now - last_base_cmd_time >= base_interval:
                     x, y, theta = self._interpolate_base_pose(chunk_waypoints, t)
-                    self._base_backend.execute_action(x, y, theta)
+                    # Convert from world/mocap frame to odom frame
+                    odom_cmd = self._world_to_odom(x, y, theta)
+                    if odom_cmd is not None:
+                        last_base_cmd = odom_cmd
+                    if last_base_cmd is not None:
+                        self._base_backend.execute_action(*last_base_cmd)
+                    else:
+                        self._base_backend.execute_action(x, y, theta)
                     last_base_cmd_time = now
 
             # Interpolate and send arm position at command_rate
@@ -972,7 +1062,13 @@ class RewindOrchestrator:
 
         # Ensure we end at the final position
         if "base" in components and self._base_backend:
-            self._base_backend.execute_action(final_wp.x, final_wp.y, final_wp.theta)
+            odom_cmd = self._world_to_odom(final_wp.x, final_wp.y, final_wp.theta)
+            if odom_cmd is not None:
+                last_base_cmd = odom_cmd
+            if last_base_cmd is not None:
+                self._base_backend.execute_action(*last_base_cmd)
+            else:
+                self._base_backend.execute_action(final_wp.x, final_wp.y, final_wp.theta)
         if "arm" in components and self._arm_backend and final_wp.arm_q:
             self._arm_backend.send_joint_position(final_wp.arm_q, blocking=False)
 
@@ -987,9 +1083,13 @@ class RewindOrchestrator:
             wp: Waypoint to execute.
             components: Components to command.
         """
-        # Base
+        # Base — convert waypoint pose from world/mocap frame to odom frame
         if "base" in components and self._base_backend:
-            self._base_backend.execute_action(wp.x, wp.y, wp.theta)
+            odom_cmd = self._world_to_odom(wp.x, wp.y, wp.theta)
+            if odom_cmd is not None:
+                self._base_backend.execute_action(*odom_cmd)
+            else:
+                self._base_backend.execute_action(wp.x, wp.y, wp.theta)
 
         # Arm - use non-blocking (streaming) for faster command rate
         if "arm" in components and self._arm_backend and wp.arm_q:
