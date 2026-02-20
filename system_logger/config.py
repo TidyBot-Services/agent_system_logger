@@ -195,9 +195,13 @@ class RewindConfig:
     monitor_interval: float = 0.1           # seconds between boundary checks
 
     # Collision detection (active when auto_rewind_enabled is True)
-    collision_velocity_threshold: float = 0.3   # actual/commanded ratio below this = collision
-    collision_min_cmd_speed: float = 0.05       # m/s minimum commanded speed to consider
-    collision_grace_period: float = 0.5         # seconds before triggering
+    # Dual-threshold: arm when ratio exceeds arm_threshold, trigger when below trigger_threshold
+    # Normal cruising ratio: 0.70-0.90 (never below 0.60)
+    # Kick/collision ratio: drops to 0.20-0.40
+    collision_arm_threshold: float = 0.6       # ratio must exceed this to arm detector
+    collision_trigger_threshold: float = 0.5   # ratio must drop below this to trigger
+    collision_min_cmd_speed: float = 0.05      # m/s minimum commanded speed to consider
+    collision_grace_period: float = 0.3        # seconds below trigger threshold before firing
 
 
 @dataclass

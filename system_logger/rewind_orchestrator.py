@@ -200,6 +200,7 @@ class RewindOrchestrator:
 
         # State
         self._is_rewinding = False
+        self._cancel_requested = False
 
     # -------------------------------------------------------------------------
     # Configuration
@@ -219,6 +220,12 @@ class RewindOrchestrator:
     def is_rewinding(self) -> bool:
         """Return True if a rewind operation is in progress."""
         return self._is_rewinding
+
+    def cancel_rewind(self) -> None:
+        """Request cancellation of any in-progress rewind."""
+        if self._is_rewinding:
+            self._cancel_requested = True
+            logger.warning("[RewindOrchestrator] Rewind cancellation requested")
 
     @property
     def trajectory_length(self) -> int:
@@ -542,10 +549,11 @@ class RewindOrchestrator:
 
         arm_connected = self._arm_backend and getattr(self._arm_backend, "is_connected", True)
 
-        if arm_connected:
+        trajectory_len = len(self._logger)
+        if trajectory_len > 0 and arm_connected:
             # Full trajectory rewind (safe retraction for arm)
             result = await self.rewind_percentage(100.0, dry_run, components)
-        else:
+        elif trajectory_len > 0 and not arm_connected:
             # No arm — skip slow trajectory replay, just clear trajectory
             logger.info("[RewindOrchestrator] Arm not connected, skipping trajectory rewind")
             if not dry_run:
@@ -554,6 +562,14 @@ class RewindOrchestrator:
                 success=True,
                 steps_rewound=0,
                 components_rewound=["base"],
+            )
+        else:
+            # No trajectory — skip rewind, go straight to convergence
+            logger.info("[RewindOrchestrator] No trajectory to rewind, going directly to home")
+            result = RewindResult(
+                success=True,
+                steps_rewound=0,
+                components_rewound=[],
             )
 
         if not dry_run and result.success:
@@ -904,6 +920,10 @@ class RewindOrchestrator:
 
             # Process waypoints in chunks
             for chunk_idx in range(n_chunks):
+                if self._cancel_requested:
+                    logger.warning("[RewindOrchestrator] Rewind cancelled")
+                    break
+
                 chunk_start = chunk_idx * chunk_size
                 chunk_end = min(chunk_start + chunk_size, n_waypoints)
                 chunk_waypoints = waypoints_to_execute[chunk_start:chunk_end]
@@ -980,6 +1000,7 @@ class RewindOrchestrator:
                 except Exception as e:
                     logger.warning(f"[RewindOrchestrator] Failed to restore gains: {e}")
             self._is_rewinding = False
+            self._cancel_requested = False
             self._logger.resume()
 
     def _interpolate_base_pose(
