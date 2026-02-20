@@ -206,6 +206,11 @@ class RewindOrchestrator:
     # -------------------------------------------------------------------------
 
     @property
+    def bounds(self) -> "WorkspaceBounds":
+        """Return the workspace bounds object."""
+        return self._bounds
+
+    @property
     def config(self) -> RewindConfig:
         """Return the rewind configuration."""
         return self._config
@@ -330,10 +335,11 @@ class RewindOrchestrator:
 
         distances = self._bounds.base_distance_to_boundary(x, y)
 
-        return {
+        result = {
             "x": x,
             "y": y,
             "out_of_bounds": not self._bounds.is_base_in_bounds(x, y),
+            "boundary_type": "hull" if self._bounds.has_hull else "aabb",
             "bounds": {
                 "x_min": self._bounds.base_x_min,
                 "x_max": self._bounds.base_x_max,
@@ -342,6 +348,11 @@ class RewindOrchestrator:
             },
             "distances": distances,
         }
+
+        if self._bounds.has_hull:
+            result["hull_vertices"] = self._bounds.hull_vertices
+
+        return result
 
     def find_last_safe_waypoint(self) -> Optional[int]:
         """Find the index of the last waypoint where base was within bounds.
@@ -529,10 +540,24 @@ class RewindOrchestrator:
         """
         logger.info("[RewindOrchestrator] Reset to home triggered")
 
-        result = await self.rewind_percentage(100.0, dry_run, components)
+        arm_connected = self._arm_backend and getattr(self._arm_backend, "is_connected", True)
+
+        if arm_connected:
+            # Full trajectory rewind (safe retraction for arm)
+            result = await self.rewind_percentage(100.0, dry_run, components)
+        else:
+            # No arm — skip slow trajectory replay, just clear trajectory
+            logger.info("[RewindOrchestrator] Arm not connected, skipping trajectory rewind")
+            if not dry_run:
+                self._logger.truncate(0)
+            result = RewindResult(
+                success=True,
+                steps_rewound=0,
+                components_rewound=["base"],
+            )
 
         if not dry_run and result.success:
-            if self._arm_backend:
+            if arm_connected:
                 await self._converge_arm_to_target(self._config.arm_home_q)
             if self._base_backend:
                 await self._converge_base_to_target((0.0, 0.0, 0.0))
